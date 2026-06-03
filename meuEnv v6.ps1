@@ -651,6 +651,27 @@ try {
             -Source "winget" `
             -InstalledName "VeraCrypt" `
             -Notes "Software de criptografia."
+
+        New-Package `
+            -Name "Microsoft PC Manager" `
+            -Id "9PM860492SZD" `
+            -Source "msstore" `
+            -InstalledName "Microsoft PC Manager" `
+            -Notes "App oficial distribuído pela Microsoft Store."
+
+        New-Package `
+            -Name "PowerToys" `
+            -Id "Microsoft.PowerToys" `
+            -Source "winget" `
+            -InstalledName "PowerToys (Preview)" `
+            -Notes "Utilitários Microsoft para produtividade. Distribuído via winget (método oficial recomendado pela Microsoft)."
+
+        New-Package `
+            -Name "OBS Studio" `
+            -Id "OBSProject.OBSStudio" `
+            -Source "winget" `
+            -InstalledName "OBS Studio" `
+            -Notes "Software de captura e transmissão de vídeo."
     )
 
     foreach ($pkg in $packages) {
