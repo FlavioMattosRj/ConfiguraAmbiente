@@ -1,10 +1,10 @@
-﻿﻿#Requires -RunAsAdministrator
+﻿#Requires -RunAsAdministrator
 
 param(
     [Alias("DruRun")]
     [switch]$DryRun,
 
-    [ValidateSet("Base", "PowerShell", "Java", "Maven", "Node", "Python", "IDE", "Servers", "Database", "Cli", "DataScience")]
+    [ValidateSet("Base", "PowerShell", "Java", "Maven", "Node", "Python", "IDE", "Servers", "Database", "Cli", "DataScience", "Colibri")]
     [string[]]$Only = @()
 )
 
@@ -916,6 +916,209 @@ function Install-MavenFromApacheZip {
     }
 }
 
+# ===========================================================
+# Toolchain para build do Colibri AI (https://github.com/JustVugg/colibri)
+# MSYS2 (gcc/make/sh.exe) + MSVC Build Tools (workload C++, host do nvcc) + CUDA Toolkit
+# ===========================================================
+
+function Test-Msys2ToolchainReady {
+    param([Parameter(Mandatory)][string]$Msys2Root)
+
+    $shExe = Join-Path $Msys2Root "usr\bin\sh.exe"
+    $makeExe = Join-Path $Msys2Root "usr\bin\make.exe"
+    $gccExe = Join-Path $Msys2Root "mingw64\bin\gcc.exe"
+
+    return (Test-Path $shExe) -and (Test-Path $makeExe) -and (Test-Path $gccExe)
+}
+
+function Invoke-Msys2Pacman {
+    param(
+        [Parameter(Mandatory)][string]$Msys2Root,
+        [Parameter(Mandatory)][string]$PacmanCommand
+    )
+
+    $bashExe = Join-Path $Msys2Root "usr\bin\bash.exe"
+    $cmdLine = "`"$bashExe`" -lc `"$PacmanCommand`""
+    Write-Host "Executando: $cmdLine" -ForegroundColor DarkGray
+
+    $output = & $bashExe -lc $PacmanCommand 2>&1 | Out-String
+    $exitCode = $LASTEXITCODE
+    Write-RawWingetLog -CommandLine $cmdLine -ExitCode $exitCode -Output $output
+
+    return [PSCustomObject]@{ ExitCode = $exitCode; Output = $output }
+}
+
+function Install-Msys2ToolchainForColibri {
+    Write-Host ""
+    Write-Host "============================================================" -ForegroundColor DarkGray
+    Write-Host "🐧 Verificando MSYS2 (gcc, make, sh.exe)..." -ForegroundColor Yellow
+
+    Install-OrUpgrade-WingetPackage -Package (New-Package -Name "MSYS2" -Id "MSYS2.MSYS2" -Source "winget" `
+        -Notes "Base do toolchain POSIX no Windows. O Colibri exige sh.exe, que pacotes como scoop/mingw-winlibs nao fornecem.")
+
+    $msys2Root = "C:\msys64"
+
+    if ($DryRun) {
+        Write-Host "DRY-RUN: pacman seria sincronizado e os pacotes 'make' e 'mingw-w64-x86_64-gcc' seriam instalados/atualizados em $msys2Root." -ForegroundColor Yellow
+        Add-Result -Name "MSYS2 toolchain (gcc + make)" -Id "mingw-w64-x86_64-gcc, make" -Source "pacman" -Status "Pendente" -Details "DRY-RUN: pacotes seriam sincronizados via pacman."
+        return
+    }
+
+    if (-not (Test-Path $msys2Root)) {
+        Write-Warning "⚠️ MSYS2 não encontrado em $msys2Root após a instalação via winget."
+        Add-Result -Name "MSYS2 toolchain (gcc + make)" -Id "mingw-w64-x86_64-gcc, make" -Source "pacman" -Status "Verificar" -Details "Diretório $msys2Root não encontrado. Verifique se o winget instalou em outro local."
+        return
+    }
+
+    try {
+        # pacman -Syuu pode encerrar o processo bash na primeira execucao, ao atualizar o msys2-runtime;
+        # por isso é executado duas vezes, de forma tolerante a esse encerramento esperado.
+        Invoke-Msys2Pacman -Msys2Root $msys2Root -PacmanCommand "pacman -Syuu --noconfirm" | Out-Null
+        Invoke-Msys2Pacman -Msys2Root $msys2Root -PacmanCommand "pacman -Syuu --noconfirm" | Out-Null
+
+        $installResult = Invoke-Msys2Pacman -Msys2Root $msys2Root -PacmanCommand "pacman -S --noconfirm --needed make mingw-w64-x86_64-gcc"
+
+        Add-MachinePathEntry -PathEntry (Join-Path $msys2Root "usr\bin")
+        Add-MachinePathEntry -PathEntry (Join-Path $msys2Root "mingw64\bin")
+        Update-SessionPath
+
+        if (Test-Msys2ToolchainReady -Msys2Root $msys2Root) {
+            Write-Host "✅ MSYS2 toolchain pronto: gcc, make e sh.exe encontrados." -ForegroundColor Green
+            Add-Result -Name "MSYS2 toolchain (gcc + make)" -Id "mingw-w64-x86_64-gcc, make" -Source "pacman" -Status "OK" -Details "sh.exe, make.exe e gcc.exe confirmados em $msys2Root."
+        }
+        else {
+            Write-Warning "⚠️ pacman executou (código $($installResult.ExitCode)), mas gcc/make/sh.exe não foram todos confirmados."
+            Add-Result -Name "MSYS2 toolchain (gcc + make)" -Id "mingw-w64-x86_64-gcc, make" -Source "pacman" -Status "Verificar" -Details "Código do pacman: $($installResult.ExitCode). Verifique o log bruto para detalhes."
+        }
+    }
+    catch {
+        Write-Warning "⚠️ Erro ao instalar toolchain MSYS2: $_"
+        Add-Result -Name "MSYS2 toolchain (gcc + make)" -Id "mingw-w64-x86_64-gcc, make" -Source "pacman" -Status "Erro" -Details "$_"
+    }
+}
+
+function Get-VsWherePath {
+    return Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
+}
+
+function Test-VCToolsWorkloadInstalled {
+    $vswhere = Get-VsWherePath
+    if (-not (Test-Path $vswhere)) { return $false }
+
+    $installPath = & $vswhere -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath -latest 2>$null
+    return [bool]($installPath -and $installPath.Trim())
+}
+
+function Get-AnyVisualStudioInstallPath {
+    $vswhere = Get-VsWherePath
+    if (-not (Test-Path $vswhere)) { return $null }
+
+    $installPath = & $vswhere -products * -latest -property installationPath 2>$null
+    if ($installPath -and $installPath.Trim()) { return $installPath.Trim() }
+    return $null
+}
+
+function Install-VCBuildToolsForCuda {
+    Write-Host ""
+    Write-Host "============================================================" -ForegroundColor DarkGray
+    Write-Host "🧱 Verificando MSVC Build Tools (workload C++, necessário para o nvcc)..." -ForegroundColor Yellow
+
+    try {
+        if (Test-VCToolsWorkloadInstalled) {
+            Write-Host "✅ Workload C++ (VC.Tools.x86.x64) já presente." -ForegroundColor Green
+            Add-Result -Name "MSVC Build Tools (workload C++)" -Id "Microsoft.VisualStudio.Component.VC.Tools.x86.x64" -Source "winget/VS Installer" -Status "OK" -Details "Componente C++ detectado via vswhere."
+            return
+        }
+
+        if ($DryRun) {
+            Write-Host "DRY-RUN: instalaria/completaria o VS Build Tools 2022 com o workload Desktop Development with C++." -ForegroundColor Yellow
+            Add-Result -Name "MSVC Build Tools (workload C++)" -Id "Microsoft.VisualStudio.Component.VC.Tools.x86.x64" -Source "winget/VS Installer" -Status "Pendente" -Details "DRY-RUN: workload C++ seria instalado/adicionado."
+            return
+        }
+
+        $existingInstallPath = Get-AnyVisualStudioInstallPath
+        if ($existingInstallPath) {
+            Write-Host "🔄 Instância do Visual Studio/Build Tools já presente, mas sem o workload C++. Adicionando via modify..." -ForegroundColor Cyan
+
+            $setupExe = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\setup.exe"
+            $cmdLine = "`"$setupExe`" modify --installPath `"$existingInstallPath`" --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended --quiet --norestart --wait"
+            Write-Host "Executando: $cmdLine" -ForegroundColor DarkGray
+
+            $output = & $setupExe modify --installPath $existingInstallPath --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended --quiet --norestart --wait 2>&1 | Out-String
+            $exitCode = $LASTEXITCODE
+            Write-RawWingetLog -CommandLine $cmdLine -ExitCode $exitCode -Output $output
+        }
+        else {
+            Write-Host "⬇️ Nenhuma instância do Visual Studio encontrada. Instalando VS Build Tools 2022 com o workload C++..." -ForegroundColor Cyan
+
+            $overrideArgs = "--quiet --wait --norestart --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"
+            $installArgs = @("install", "--id", "Microsoft.VisualStudio.2022.BuildTools", "--source", "winget", "--accept-package-agreements", "--accept-source-agreements", "--disable-interactivity", "--override", $overrideArgs)
+
+            $result = Invoke-WingetQuiet -Arguments $installArgs
+            $exitCode = $result.ExitCode
+        }
+
+        if (Test-VCToolsWorkloadInstalled) {
+            Write-Host "✅ MSVC Build Tools com workload C++ confirmado." -ForegroundColor Green
+            Add-Result -Name "MSVC Build Tools (workload C++)" -Id "Microsoft.VisualStudio.Component.VC.Tools.x86.x64" -Source "winget/VS Installer" -Status "OK" -Details "Workload C++ instalado/confirmado. Código: $exitCode."
+        }
+        else {
+            Write-Warning "⚠️ Não foi possível confirmar o workload C++ do VS Build Tools após a instalação."
+            Add-Result -Name "MSVC Build Tools (workload C++)" -Id "Microsoft.VisualStudio.Component.VC.Tools.x86.x64" -Source "winget/VS Installer" -Status "Verificar" -Details "Instalação/modify retornou código $exitCode, mas vswhere não confirmou o componente VC.Tools.x86.x64."
+        }
+    }
+    catch {
+        Write-Warning "⚠️ Erro ao instalar/configurar MSVC Build Tools: $_"
+        Add-Result -Name "MSVC Build Tools (workload C++)" -Id "Microsoft.VisualStudio.Component.VC.Tools.x86.x64" -Source "winget/VS Installer" -Status "Erro" -Details "$_"
+    }
+}
+
+function Test-CudaMinimumVersion {
+    $nvccCmd = Get-Command nvcc -ErrorAction SilentlyContinue
+    if (-not $nvccCmd) { return $null }
+
+    $versionOutput = & nvcc --version 2>&1 | Out-String
+    if ($versionOutput -match "release\s+([0-9]+\.[0-9]+)") {
+        return [version]$Matches[1]
+    }
+
+    return $null
+}
+
+function Install-CudaToolkitForColibri {
+    param([Parameter(Mandatory)][version]$MinimumVersion)
+
+    Install-OrUpgrade-WingetPackage -Package (New-Package -Name "NVIDIA CUDA Toolkit" -Id "Nvidia.CUDA" -Source "winget" `
+        -Notes "Fornece nvcc, cuBLAS e headers para compilar a CUDA DLL do Colibri. Requer versão $MinimumVersion+ para suporte a Blackwell/sm_120.")
+
+    Update-SessionPath
+
+    Write-Host ""
+    Write-Host "🔎 Validando versão do CUDA Toolkit (mínimo $MinimumVersion para sm_120)..." -ForegroundColor DarkGray
+
+    if ($DryRun) {
+        Add-Result -Name "CUDA Toolkit (versão mínima $MinimumVersion)" -Id "nvcc" -Source "Nvidia.CUDA" -Status "Pendente" -Details "DRY-RUN: versão do nvcc seria validada após instalação."
+        return
+    }
+
+    $installedVersion = Test-CudaMinimumVersion
+
+    if (-not $installedVersion) {
+        Write-Warning "⚠️ nvcc não encontrado no PATH após a instalação do CUDA Toolkit."
+        Add-Result -Name "CUDA Toolkit (versão mínima $MinimumVersion)" -Id "nvcc" -Source "Nvidia.CUDA" -Status "Verificar" -Details "nvcc não localizado no PATH após instalação/atualização."
+        return
+    }
+
+    if ($installedVersion -ge $MinimumVersion) {
+        Write-Host "✅ CUDA Toolkit $installedVersion atende ao mínimo exigido ($MinimumVersion)." -ForegroundColor Green
+        Add-Result -Name "CUDA Toolkit (versão mínima $MinimumVersion)" -Id "nvcc" -Source "Nvidia.CUDA" -Status "OK" -Details "Versão detectada: $installedVersion."
+    }
+    else {
+        Write-Warning "⚠️ CUDA Toolkit $installedVersion é anterior ao mínimo exigido ($MinimumVersion) para sm_120/Blackwell."
+        Add-Result -Name "CUDA Toolkit (versão mínima $MinimumVersion)" -Id "nvcc" -Source "Nvidia.CUDA" -Status "Verificar" -Details "Versão detectada: $installedVersion. O catálogo winget pode ainda não ter a versão $MinimumVersion+; baixe manualmente em https://developer.nvidia.com/cuda-downloads se necessário."
+    }
+}
+
 try {
     Write-Host "🚀 Iniciando configuração do ambiente de desenvolvimento PowerShell..." -ForegroundColor Green
 
@@ -926,7 +1129,7 @@ try {
         Write-Host "Filtro -Only ativo: $($Only -join ', ')" -ForegroundColor Cyan
     }
 
-    $wingetSections = @("Base", "Java", "Node", "Python", "IDE", "Database", "Cli", "DataScience")
+    $wingetSections = @("Base", "Java", "Node", "Python", "IDE", "Database", "Cli", "DataScience", "Colibri")
     $requiresWinget = (-not $Only -or $Only.Count -eq 0 -or @($Only | Where-Object { $wingetSections -contains $_ }).Count -gt 0)
 
     if ($requiresWinget -and -not (Test-CommandExists -Command "winget")) {
@@ -1268,6 +1471,23 @@ try {
     # Orange Data Mining — tentar via winget.
     Install-OrUpgrade-WingetPackage -Package (New-Package -Name "Orange Data Mining" -Id "UniversityOfLjubljana.Orange" -Source "winget" `
         -Notes "Plataforma visual de data mining e ML. Se nao encontrado no winget, baixe em https://orangedatamining.com/download/")
+    }
+
+    Invoke-Section -Section "Colibri" -ScriptBlock {
+    # ===========================================================
+    # Toolchain de build do Colibri AI (https://github.com/JustVugg/colibri)
+    # Ordem importa: MSYS2 -> MSVC Build Tools -> CUDA Toolkit (facilita a
+    # integracao do CUDA Toolkit com o Visual Studio ja presente).
+    # ===========================================================
+    Write-Host ""
+    Write-Host "============================================================" -ForegroundColor DarkGray
+    Write-Host "🐤 Preparando toolchain de build do Colibri AI..." -ForegroundColor Cyan
+
+    Install-Msys2ToolchainForColibri
+
+    Install-VCBuildToolsForCuda
+
+    Install-CudaToolkitForColibri -MinimumVersion ([version]"12.8")
     }
 
     Write-Host ""
