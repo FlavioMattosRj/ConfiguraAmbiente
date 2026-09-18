@@ -133,20 +133,38 @@ function New-Package {
 
         [string]$FallbackInstalledName = "",
 
-        [string]$Notes = ""
+        [string]$Notes = "",
+
+        [int]$PostInstallMaxWaitSeconds = 0
     )
 
     return [PSCustomObject]@{
-        Name                  = $Name
-        Id                    = $Id
-        Source                = $Source
-        InstalledName         = $InstalledName
-        Verifier              = $Verifier
-        InstallerType         = $InstallerType
-        FallbackId            = $FallbackId
-        FallbackSource        = $FallbackSource
-        FallbackInstalledName = $FallbackInstalledName
-        Notes                 = $Notes
+        Name                      = $Name
+        Id                        = $Id
+        Source                    = $Source
+        InstalledName             = $InstalledName
+        Verifier                  = $Verifier
+        InstallerType             = $InstallerType
+        FallbackId                = $FallbackId
+        FallbackSource            = $FallbackSource
+        FallbackInstalledName     = $FallbackInstalledName
+        Notes                     = $Notes
+        PostInstallMaxWaitSeconds = $PostInstallMaxWaitSeconds
+    }
+}
+
+function New-SpecialPackage {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Name,
+
+        [Parameter(Mandatory)]
+        [scriptblock]$Handler
+    )
+
+    return [PSCustomObject]@{
+        Name    = $Name
+        Handler = $Handler
     }
 }
 
@@ -267,6 +285,34 @@ function Test-WingetPackageInstalled {
     }
 
     return $false
+}
+
+function Wait-ForPackageInstallConfirmation {
+    param(
+        [Parameter(Mandatory)]
+        [object]$Package,
+
+        [int]$PollIntervalSeconds = 20
+    )
+
+    if ($Package.PostInstallMaxWaitSeconds -le 0) {
+        return (Test-WingetPackageInstalled -Package $Package)
+    }
+
+    $deadline = (Get-Date).AddSeconds($Package.PostInstallMaxWaitSeconds)
+
+    while ($true) {
+        if (Test-WingetPackageInstalled -Package $Package) {
+            return $true
+        }
+
+        if ((Get-Date) -ge $deadline) {
+            return $false
+        }
+
+        Write-Host "⏳ Aguardando confirmação de instalação de $($Package.Name) (instalação continua em segundo plano)..." -ForegroundColor DarkGray
+        Start-Sleep -Seconds $PollIntervalSeconds
+    }
 }
 
 function Install-WingetPackage {
@@ -428,7 +474,7 @@ function Install-OrUpgrade-WingetPackage {
             $result = Upgrade-WingetPackage -Package $Package
             $exitCode = $result.ExitCode
 
-            $stillInstalled = Test-WingetPackageInstalled -Package $Package
+            $stillInstalled = Wait-ForPackageInstallConfirmation -Package $Package
 
             if ($stillInstalled) {
                 Write-Host "✅ OK: $($Package.Name) está instalado/presente." -ForegroundColor Green
@@ -462,7 +508,7 @@ function Install-OrUpgrade-WingetPackage {
         $result = Install-WingetPackage -Package $Package
         $exitCode = $result.ExitCode
 
-        $installedAfterAttempt = Test-WingetPackageInstalled -Package $Package
+        $installedAfterAttempt = Wait-ForPackageInstallConfirmation -Package $Package
 
         if ($installedAfterAttempt) {
             Write-Host "✅ OK: $($Package.Name) está instalado/presente." -ForegroundColor Green
@@ -505,6 +551,124 @@ function Install-OrUpgrade-WingetPackage {
             -Name $Package.Name `
             -Id $Package.Id `
             -Source $Package.Source `
+            -Status "Erro" `
+            -Details "$_"
+    }
+}
+
+function Install-OfficeViaDeploymentTool {
+    $officeName = "Microsoft Office"
+    $officeId = "O365ProPlusRetail (via ODT)"
+    $officeSource = "odt"
+
+    Write-Host ""
+    Write-Host "============================================================" -ForegroundColor DarkGray
+    Write-Host "📦 Verificando: $officeName" -ForegroundColor Yellow
+    Write-Host "Nota: instalado via Office Deployment Tool (ODT), não pelo pacote winget Microsoft.Office." -ForegroundColor DarkGray
+    Write-Host "Motivo: o manifesto winget de Microsoft.Office aponta para uma URL 'evergreen' que a Microsoft" -ForegroundColor DarkGray
+    Write-Host "substitui no mesmo endereço, causando falhas recorrentes de verificação de hash." -ForegroundColor DarkGray
+
+    try {
+        if (Test-OfficeClickToRunInstalled) {
+            Write-Host "✅ OK: Office Click-to-Run já está instalado (ele se atualiza sozinho)." -ForegroundColor Green
+
+            Add-Result `
+                -Name $officeName `
+                -Id $officeId `
+                -Source $officeSource `
+                -Status "OK" `
+                -Details "Office Click-to-Run já instalado. ODT não foi executado nesta rodada."
+
+            return
+        }
+
+        $odtDir = Join-Path $env:ProgramData "OfficeDeploymentTool"
+        New-Item -ItemType Directory -Path $odtDir -Force | Out-Null
+
+        Write-Host "⬇️ Baixando/extraindo o Office Deployment Tool..." -ForegroundColor Cyan
+
+        $odtInstallArgs = @(
+            "install", "-e",
+            "--id", "Microsoft.OfficeDeploymentTool",
+            "--source", "winget",
+            "--accept-package-agreements",
+            "--accept-source-agreements",
+            "--disable-interactivity",
+            "--override", "/quiet /extract:`"$odtDir`""
+        )
+
+        $odtResult = Invoke-WingetQuiet -Arguments $odtInstallArgs
+        $odtSetupExe = Join-Path $odtDir "setup.exe"
+
+        if (-not (Test-Path $odtSetupExe)) {
+            Add-Result `
+                -Name $officeName `
+                -Id $officeId `
+                -Source $officeSource `
+                -Status "Erro" `
+                -Details "Falha ao extrair o Office Deployment Tool em $odtDir. Código winget: $($odtResult.ExitCode). Veja log bruto."
+
+            return
+        }
+
+        $arch = if ([Environment]::Is64BitOperatingSystem) { "64" } else { "32" }
+        $configXmlPath = Join-Path $odtDir "office-config.xml"
+
+        $configXml = @"
+<Configuration>
+  <Add OfficeClientEdition="$arch" Channel="Current">
+    <Product ID="O365ProPlusRetail">
+      <Language ID="MatchOS" />
+    </Product>
+  </Add>
+  <Updates Enabled="TRUE" />
+  <Display Level="None" AcceptEULA="TRUE" />
+</Configuration>
+"@
+
+        Set-Content -Path $configXmlPath -Value $configXml -Encoding UTF8
+
+        Write-Host "⬇️ Instalando Microsoft 365 Apps via ODT (download completo; pode levar vários minutos)..." -ForegroundColor Cyan
+
+        $setupProcess = Start-Process -FilePath $odtSetupExe -ArgumentList "/configure `"$configXmlPath`"" -Wait -PassThru -WindowStyle Hidden
+        $exitCode = $setupProcess.ExitCode
+
+        $officePackageForWait = [PSCustomObject]@{
+            Verifier                  = "office-clicktorun"
+            PostInstallMaxWaitSeconds = 300
+        }
+
+        $installed = Wait-ForPackageInstallConfirmation -Package $officePackageForWait
+
+        if ($installed) {
+            Write-Host "✅ OK: $officeName está instalado." -ForegroundColor Green
+
+            Add-Result `
+                -Name $officeName `
+                -Id $officeId `
+                -Source $officeSource `
+                -Status "OK" `
+                -Details "Instalado via Office Deployment Tool. Código de saída do setup.exe /configure: $exitCode."
+
+            return
+        }
+
+        Write-Warning "⚠️ $officeName não foi confirmado como instalado após o ODT. Código: $exitCode"
+
+        Add-Result `
+            -Name $officeName `
+            -Id $officeId `
+            -Source $officeSource `
+            -Status "Verificar" `
+            -Details "setup.exe /configure retornou código $exitCode, mas a instalação não foi confirmada. Veja logs do ODT em $odtDir e em %TEMP%."
+    }
+    catch {
+        Write-Warning "⚠️ Erro ao instalar $officeName via ODT: $_"
+
+        Add-Result `
+            -Name $officeName `
+            -Id $officeId `
+            -Source $officeSource `
             -Status "Erro" `
             -Details "$_"
     }
@@ -576,17 +740,14 @@ try {
 
         New-Package `
             -Name "Perplexity Desktop App" `
-            -Id "XP8JNQFBQH6PVF" `
+            -Id "9P9XG917PWCJ" `
             -Source "msstore" `
             -InstalledName "Perplexity" `
             -Notes "App da Microsoft Store."
 
-        New-Package `
+        New-SpecialPackage `
             -Name "Microsoft Office" `
-            -Id "Microsoft.Office" `
-            -Source "winget" `
-            -Verifier "office-clicktorun" `
-            -Notes "Validação especial: confirma Office Click-to-Run e executáveis como Word, Excel ou PowerPoint."
+            -Handler ${function:Install-OfficeViaDeploymentTool}
 
         New-Package `
             -Name "Adobe Creative Cloud" `
@@ -675,7 +836,12 @@ try {
     )
 
     foreach ($pkg in $packages) {
-        Install-OrUpgrade-WingetPackage -Package $pkg
+        if ($pkg.Handler) {
+            & $pkg.Handler
+        }
+        else {
+            Install-OrUpgrade-WingetPackage -Package $pkg
+        }
     }
 
     Write-Host ""
