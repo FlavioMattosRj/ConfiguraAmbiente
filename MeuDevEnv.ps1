@@ -488,70 +488,6 @@ function Add-MachinePathEntry {
     }
 }
 
-function Install-VSCodeExtension {
-    param(
-        [Parameter(Mandatory)][string]$DisplayName,
-        [Parameter(Mandatory)][string]$ExtensionId,
-        [string]$Notes = ""
-    )
-
-    Write-Host ""
-    Write-Host "============================================================" -ForegroundColor DarkGray
-    Write-Host "🧩 Instalando extensão VS Code: $DisplayName" -ForegroundColor Yellow
-    Write-Host "ID: $ExtensionId" -ForegroundColor DarkGray
-    if ($Notes) { Write-Host "Nota: $Notes" -ForegroundColor DarkGray }
-
-    try {
-        # O PATH já deve ter sido sincronizado antes desta função ser chamada.
-        # Não há fallback manual aqui: se 'code' não estiver no PATH, isso será registrado como pendência.
-        $codeCmd = Get-Command code -ErrorAction SilentlyContinue
-
-        if ($codeCmd) {
-            $extInstallCmd = "`"$($codeCmd.Source)`" --install-extension $ExtensionId"
-            Write-Host "Executando: $extInstallCmd" -ForegroundColor DarkGray
-
-            if ($DryRun) {
-                Write-Host "DRY-RUN: extensão não instalada." -ForegroundColor Yellow
-                Write-RawWingetLog -CommandLine $extInstallCmd -ExitCode 0 -Output "DRY-RUN: comando não executado."
-                Add-Result -Name "$DisplayName (VS Code)" -Id $ExtensionId -Source "VS Code CLI" -Status "Pendente" -Details "DRY-RUN: extensão seria instalada via code --install-extension."
-                return
-            }
-
-            $extOutput = Invoke-WithNativeErrorHandling { & $codeCmd.Source --install-extension $ExtensionId 2>&1 | Out-String }
-            $extExitCode = $LASTEXITCODE
-
-            Write-RawWingetLog -CommandLine $extInstallCmd -ExitCode $extExitCode -Output $extOutput
-
-            if ($extExitCode -eq 0) {
-                Write-Host "✅ Extensão instalada/presente no VS Code: $DisplayName." -ForegroundColor Green
-                Add-Result -Name "$DisplayName (VS Code)" -Id $ExtensionId -Source "VS Code CLI" -Status "OK" -Details "Extensão instalada/presente via code --install-extension."
-            }
-            else {
-                Write-Warning "⚠️ Instalação da extensão retornou código $extExitCode. Verifique o log."
-                Add-Result -Name "$DisplayName (VS Code)" -Id $ExtensionId -Source "VS Code CLI" -Status "Verificar" -Details "Código $extExitCode. Saída no log bruto."
-            }
-        }
-        else {
-            Write-Warning "⚠️ Comando 'code' não encontrado no PATH após a sincronização. A extensão não foi instalada."
-            Add-Result -Name "$DisplayName (VS Code)" -Id $ExtensionId -Source "VS Code CLI" -Status "Pendente" -Details "Comando code não encontrado no PATH após sincronização. Abra uma nova sessão ou verifique se o VS Code adicionou o diretório bin ao PATH."
-        }
-    }
-    catch {
-        Write-Warning "⚠️ Erro ao instalar extensão VS Code ${DisplayName}: $_"
-        Add-Result -Name "$DisplayName (VS Code)" -Id $ExtensionId -Source "VS Code CLI" -Status "Erro" -Details "$_"
-    }
-}
-
-function Install-VSCodeExtensions {
-    param([Parameter(Mandatory)][object[]]$Extensions)
-
-    Update-SessionPath
-
-    foreach ($extension in $Extensions) {
-        Install-VSCodeExtension -DisplayName ([string]$extension.Name) -ExtensionId ([string]$extension.Id) -Notes ([string]$extension.Notes)
-    }
-}
-
 
 function Initialize-PowerShellGallery {
     Write-Host ""
@@ -1195,22 +1131,9 @@ try {
         }
 
         Update-SessionPath
-
-        Install-VSCodeExtensions -Extensions @(
-            [PSCustomObject]@{ Name = "EditorConfig"; Id = "EditorConfig.EditorConfig"; Notes = "Suporte a .editorconfig para padronização de indentação e fim de linha." },
-            [PSCustomObject]@{ Name = "GitLens"; Id = "eamodio.gitlens"; Notes = "Recursos avançados de Git dentro do VS Code." }
-        )
     }
 
     Invoke-Section -Section "PowerShell" -ScriptBlock {
-        # Sincronizar PATH antes de chamar o CLI 'code'.
-        Update-SessionPath
-
-        # Extensão oficial da Microsoft para desenvolvimento PowerShell no VS Code.
-        Install-VSCodeExtensions -Extensions @(
-            [PSCustomObject]@{ Name = "PowerShell"; Id = "ms-vscode.powershell"; Notes = "Extensão oficial da Microsoft para edição, debug e IntelliSense PowerShell." }
-        )
-
         # Módulos gratuitos úteis ao desenvolvimento PowerShell.
         $psGalleryModules = @(
             [PSCustomObject]@{ Name = "Pester"; Notes = "Framework de testes automatizados para PowerShell." },
@@ -1261,12 +1184,6 @@ try {
             }
         }
     }
-
-    Update-SessionPath
-
-    Install-VSCodeExtensions -Extensions @(
-        [PSCustomObject]@{ Name = "Extension Pack for Java"; Id = "vscjava.vscode-java-pack"; Notes = "Pacote principal de extensões Java para VS Code." }
-    )
     }
 
     Invoke-Section -Section "Maven" -ScriptBlock {
@@ -1274,12 +1191,6 @@ try {
     # Apache Maven
     # ===========================================================
     Install-MavenFromApacheZip
-
-    Update-SessionPath
-
-    Install-VSCodeExtensions -Extensions @(
-        [PSCustomObject]@{ Name = "Maven for Java"; Id = "vscjava.vscode-maven"; Notes = "Gerenciamento de projetos Maven no VS Code." }
-    )
     }
 
     Invoke-Section -Section "Node" -ScriptBlock {
@@ -1320,13 +1231,6 @@ try {
     Install-OrUpgrade-WingetPackage -Package (New-Package -Name "Yarn" -Id "Yarn.Yarn" -Source "winget" `
         -Notes "Gerenciador de pacotes JavaScript. Instalado via winget (Yarn Classic v1).")
 
-    Update-SessionPath
-
-    Install-VSCodeExtensions -Extensions @(
-        [PSCustomObject]@{ Name = "Angular Language Service"; Id = "angular.ng-template"; Notes = "Suporte oficial a templates Angular." },
-        [PSCustomObject]@{ Name = "ESLint"; Id = "dbaeumer.vscode-eslint"; Notes = "Integração ESLint para JavaScript/TypeScript." },
-        [PSCustomObject]@{ Name = "Prettier"; Id = "esbenp.prettier-vscode"; Notes = "Formatador comum para JS/TS/JSON/YAML/Markdown." }
-    )
     }
 
     Invoke-Section -Section "Python" -ScriptBlock {
@@ -1388,12 +1292,6 @@ try {
     # Jupyter (via pip)
     # ===========================================================
     Install-JupyterViaPip
-
-    Install-VSCodeExtensions -Extensions @(
-        [PSCustomObject]@{ Name = "Python"; Id = "ms-python.python"; Notes = "Extensão oficial Python para VS Code." },
-        [PSCustomObject]@{ Name = "Pylance"; Id = "ms-python.vscode-pylance"; Notes = "Language server Python da Microsoft." },
-        [PSCustomObject]@{ Name = "Jupyter"; Id = "ms-toolsai.jupyter"; Notes = "Suporte a notebooks Jupyter no VS Code." }
-    )
     }
 
     Invoke-Section -Section "IDE" -ScriptBlock {
@@ -1435,11 +1333,6 @@ try {
     Add-ManualResult -Name "Open Liberty" -Id "OpenLiberty.OpenLiberty" `
         -Reason "Sem pacote winget para Open Liberty. Baixe o ZIP em https://openliberty.io/downloads/, extraia em C:\DevTools\OpenLiberty. Usar Open Liberty (gratuito), nao IBM/WebSphere Liberty comercial."
 
-    Update-SessionPath
-
-    Install-VSCodeExtensions -Extensions @(
-        [PSCustomObject]@{ Name = "YAML"; Id = "redhat.vscode-yaml"; Notes = "Suporte YAML com validação e schemas." }
-    )
     }
 
     Invoke-Section -Section "Database" -ScriptBlock {
