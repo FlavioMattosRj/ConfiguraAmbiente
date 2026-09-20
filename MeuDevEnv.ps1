@@ -68,6 +68,34 @@ function Write-RawWingetLog {
     Add-Content -Path $wingetRawLogPath -Value ""
 }
 
+function Invoke-WithNativeErrorHandling {
+    <#
+    .SYNOPSIS
+    Executa um scriptblock que invoca um comando externo redirecionando stderr para stdout (2>&1),
+    isolando-o do $ErrorActionPreference = 'Stop' global do script.
+
+    .DESCRIPTION
+    Muitos comandos externos (code.cmd, npm, bash.exe/pacman, etc.) escrevem avisos, notices ou
+    deprecation warnings em stderr mesmo quando terminam com sucesso (exit code 0). Quando essa
+    saída é combinada via '2>&1' dentro de um script com $ErrorActionPreference = 'Stop' (agravado
+    pelo uso de Start-Transcript), cada linha de stderr é promovida a erro TERMINANTE e interrompe
+    a execução antes mesmo de o código de saída real ser avaliado — mesmo que o comando tenha
+    funcionado perfeitamente. Esta função define temporariamente $ErrorActionPreference = 'Continue'
+    apenas durante a chamada nativa, restaurando o valor original em seguida (mesmo em caso de
+    exceção), preservando o $LASTEXITCODE do comando para o chamador.
+    #>
+    param([Parameter(Mandatory)][scriptblock]$ScriptBlock)
+
+    $previousEap = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        & $ScriptBlock
+    }
+    finally {
+        $ErrorActionPreference = $previousEap
+    }
+}
+
 function Invoke-WingetQuiet {
     param([Parameter(Mandatory)][string[]]$Arguments)
 
@@ -85,7 +113,7 @@ function Invoke-WingetQuiet {
         }
     }
 
-    $output = & winget @Arguments 2>&1 | Out-String
+    $output = Invoke-WithNativeErrorHandling { & winget @Arguments 2>&1 | Out-String }
     $exitCode = $LASTEXITCODE
 
     Write-RawWingetLog -CommandLine $commandLine -ExitCode $exitCode -Output $output
@@ -460,70 +488,6 @@ function Add-MachinePathEntry {
     }
 }
 
-function Install-VSCodeExtension {
-    param(
-        [Parameter(Mandatory)][string]$DisplayName,
-        [Parameter(Mandatory)][string]$ExtensionId,
-        [string]$Notes = ""
-    )
-
-    Write-Host ""
-    Write-Host "============================================================" -ForegroundColor DarkGray
-    Write-Host "🧩 Instalando extensão VS Code: $DisplayName" -ForegroundColor Yellow
-    Write-Host "ID: $ExtensionId" -ForegroundColor DarkGray
-    if ($Notes) { Write-Host "Nota: $Notes" -ForegroundColor DarkGray }
-
-    try {
-        # O PATH já deve ter sido sincronizado antes desta função ser chamada.
-        # Não há fallback manual aqui: se 'code' não estiver no PATH, isso será registrado como pendência.
-        $codeCmd = Get-Command code -ErrorAction SilentlyContinue
-
-        if ($codeCmd) {
-            $extInstallCmd = "`"$($codeCmd.Source)`" --install-extension $ExtensionId"
-            Write-Host "Executando: $extInstallCmd" -ForegroundColor DarkGray
-
-            if ($DryRun) {
-                Write-Host "DRY-RUN: extensão não instalada." -ForegroundColor Yellow
-                Write-RawWingetLog -CommandLine $extInstallCmd -ExitCode 0 -Output "DRY-RUN: comando não executado."
-                Add-Result -Name "$DisplayName (VS Code)" -Id $ExtensionId -Source "VS Code CLI" -Status "Pendente" -Details "DRY-RUN: extensão seria instalada via code --install-extension."
-                return
-            }
-
-            $extOutput = & $codeCmd.Source --install-extension $ExtensionId 2>&1 | Out-String
-            $extExitCode = $LASTEXITCODE
-
-            Write-RawWingetLog -CommandLine $extInstallCmd -ExitCode $extExitCode -Output $extOutput
-
-            if ($extExitCode -eq 0) {
-                Write-Host "✅ Extensão instalada/presente no VS Code: $DisplayName." -ForegroundColor Green
-                Add-Result -Name "$DisplayName (VS Code)" -Id $ExtensionId -Source "VS Code CLI" -Status "OK" -Details "Extensão instalada/presente via code --install-extension."
-            }
-            else {
-                Write-Warning "⚠️ Instalação da extensão retornou código $extExitCode. Verifique o log."
-                Add-Result -Name "$DisplayName (VS Code)" -Id $ExtensionId -Source "VS Code CLI" -Status "Verificar" -Details "Código $extExitCode. Saída no log bruto."
-            }
-        }
-        else {
-            Write-Warning "⚠️ Comando 'code' não encontrado no PATH após a sincronização. A extensão não foi instalada."
-            Add-Result -Name "$DisplayName (VS Code)" -Id $ExtensionId -Source "VS Code CLI" -Status "Pendente" -Details "Comando code não encontrado no PATH após sincronização. Abra uma nova sessão ou verifique se o VS Code adicionou o diretório bin ao PATH."
-        }
-    }
-    catch {
-        Write-Warning "⚠️ Erro ao instalar extensão VS Code ${DisplayName}: $_"
-        Add-Result -Name "$DisplayName (VS Code)" -Id $ExtensionId -Source "VS Code CLI" -Status "Erro" -Details "$_"
-    }
-}
-
-function Install-VSCodeExtensions {
-    param([Parameter(Mandatory)][object[]]$Extensions)
-
-    Update-SessionPath
-
-    foreach ($extension in $Extensions) {
-        Install-VSCodeExtension -DisplayName ([string]$extension.Name) -ExtensionId ([string]$extension.Id) -Notes ([string]$extension.Notes)
-    }
-}
-
 
 function Initialize-PowerShellGallery {
     Write-Host ""
@@ -641,7 +605,7 @@ function Install-NpmGlobalTool {
 
         $existingCmd = Get-Command $ValidateCommand -ErrorAction SilentlyContinue
         if ($existingCmd) {
-            $version = & $ValidateCommand --version 2>&1 | Out-String
+            $version = Invoke-WithNativeErrorHandling { & $ValidateCommand --version 2>&1 | Out-String }
             Write-Host "✅ $DisplayName já disponível: $($version.Trim())" -ForegroundColor Green
             Add-Result -Name $DisplayName -Id $NpmPackage -Source "npm" -Status "OK" -Details "Já instalado. Versão: $($version.Trim())"
             return
@@ -657,7 +621,7 @@ function Install-NpmGlobalTool {
         $cmdLine = "npm install -g $NpmPackage"
         Write-Host "Executando: $cmdLine" -ForegroundColor DarkGray
 
-        $installOutput = & npm install -g $NpmPackage 2>&1 | Out-String
+        $installOutput = Invoke-WithNativeErrorHandling { & npm install -g $NpmPackage 2>&1 | Out-String }
         $exitCode = $LASTEXITCODE
         Write-RawWingetLog -CommandLine $cmdLine -ExitCode $exitCode -Output $installOutput
 
@@ -665,7 +629,7 @@ function Install-NpmGlobalTool {
 
         $validateAfter = Get-Command $ValidateCommand -ErrorAction SilentlyContinue
         if ($validateAfter) {
-            $version = & $ValidateCommand --version 2>&1 | Out-String
+            $version = Invoke-WithNativeErrorHandling { & $ValidateCommand --version 2>&1 | Out-String }
             Write-Host "✅ $DisplayName instalado com sucesso. Versão: $($version.Trim())" -ForegroundColor Green
             Add-Result -Name $DisplayName -Id $NpmPackage -Source "npm" -Status "OK" -Details "Instalado via npm. Versão: $($version.Trim())"
         }
@@ -695,7 +659,7 @@ function Install-JupyterViaPip {
 
         $jupyterCmd = Get-Command jupyter -ErrorAction SilentlyContinue
         if ($jupyterCmd) {
-            $version = & jupyter --version 2>&1 | Out-String
+            $version = Invoke-WithNativeErrorHandling { & jupyter --version 2>&1 | Out-String }
             Write-Host "✅ Jupyter já disponível." -ForegroundColor Green
             Add-Result -Name "Jupyter" -Id "jupyterlab+notebook" -Source "pip" -Status "OK" -Details "Já instalado. Saída de 'jupyter --version': $($version.Trim())"
             return
@@ -719,7 +683,7 @@ function Install-JupyterViaPip {
         }
 
         if (-not (Test-Path $venvPython)) {
-            $venvOut = & python -m venv $venvPath 2>&1 | Out-String
+            $venvOut = Invoke-WithNativeErrorHandling { & python -m venv $venvPath 2>&1 | Out-String }
             $venvCode = $LASTEXITCODE
             Write-RawWingetLog -CommandLine "python -m venv $venvPath" -ExitCode $venvCode -Output $venvOut
 
@@ -730,7 +694,7 @@ function Install-JupyterViaPip {
             }
         }
 
-        $pipUpgradeOut = & $venvPython -m pip install --upgrade pip 2>&1 | Out-String
+        $pipUpgradeOut = Invoke-WithNativeErrorHandling { & $venvPython -m pip install --upgrade pip 2>&1 | Out-String }
         $pipUpgradeCode = $LASTEXITCODE
         Write-RawWingetLog -CommandLine "`"$venvPython`" -m pip install --upgrade pip" -ExitCode $pipUpgradeCode -Output $pipUpgradeOut
 
@@ -740,7 +704,7 @@ function Install-JupyterViaPip {
             return
         }
 
-        $installOut = & $venvPython -m pip install jupyterlab notebook 2>&1 | Out-String
+        $installOut = Invoke-WithNativeErrorHandling { & $venvPython -m pip install jupyterlab notebook 2>&1 | Out-String }
         $installCode = $LASTEXITCODE
         Write-RawWingetLog -CommandLine "`"$venvPython`" -m pip install jupyterlab notebook" -ExitCode $installCode -Output $installOut
 
@@ -756,7 +720,7 @@ function Install-JupyterViaPip {
 
         $jupyterAfter = Get-Command jupyter -ErrorAction SilentlyContinue
         if ($jupyterAfter) {
-            $version = & jupyter --version 2>&1 | Out-String
+            $version = Invoke-WithNativeErrorHandling { & jupyter --version 2>&1 | Out-String }
             Write-Host "✅ Jupyter instalado com sucesso." -ForegroundColor Green
             Add-Result -Name "Jupyter" -Id "jupyterlab+notebook" -Source "pip/venv" -Status "OK" -Details "Instalado em venv dedicada ($venvPath). Saída: $($version.Trim())"
         }
@@ -787,7 +751,7 @@ function Resolve-LatestWingetPackageByIdPrefix {
     }
 
     try {
-        $searchOutput = & winget search $IdPrefix --source $Source --accept-source-agreements 2>&1 | Out-String
+        $searchOutput = Invoke-WithNativeErrorHandling { & winget search $IdPrefix --source $Source --accept-source-agreements 2>&1 | Out-String }
         Write-RawWingetLog -CommandLine "winget search $IdPrefix --source $Source --accept-source-agreements" -ExitCode $LASTEXITCODE -Output $searchOutput
 
         if ($LASTEXITCODE -ne 0) {
@@ -857,7 +821,7 @@ function Install-MavenFromApacheZip {
 
         $mvnCmd = Get-Command mvn -ErrorAction SilentlyContinue
         if ($mvnCmd) {
-            $mvnVersionOutput = & mvn -v 2>&1 | Out-String
+            $mvnVersionOutput = Invoke-WithNativeErrorHandling { & mvn -v 2>&1 | Out-String }
             if ($mvnVersionOutput -match "Apache Maven\s+$([regex]::Escape($latestVersion))") {
                 Write-Host "✅ Apache Maven já está na versão mais nova encontrada: $latestVersion." -ForegroundColor Green
                 Add-Result -Name "Apache Maven" -Id "Apache.Maven.Zip" -Source "Apache ZIP" -Status "OK" -Details "Já instalado. $($mvnVersionOutput.Trim())"
@@ -901,7 +865,7 @@ function Install-MavenFromApacheZip {
 
         $mvnAfter = Get-Command mvn -ErrorAction SilentlyContinue
         if ($mvnAfter) {
-            $version = & mvn -v 2>&1 | Out-String
+            $version = Invoke-WithNativeErrorHandling { & mvn -v 2>&1 | Out-String }
             Write-Host "✅ Apache Maven instalado/configurado com sucesso." -ForegroundColor Green
             Add-Result -Name "Apache Maven" -Id "Apache.Maven.Zip" -Source "Apache ZIP" -Status "OK" -Details "MAVEN_HOME=$mavenHome. Saída: $($version.Trim())"
         }
@@ -941,7 +905,7 @@ function Invoke-Msys2Pacman {
     $cmdLine = "`"$bashExe`" -lc `"$PacmanCommand`""
     Write-Host "Executando: $cmdLine" -ForegroundColor DarkGray
 
-    $output = & $bashExe -lc $PacmanCommand 2>&1 | Out-String
+    $output = Invoke-WithNativeErrorHandling { & $bashExe -lc $PacmanCommand 2>&1 | Out-String }
     $exitCode = $LASTEXITCODE
     Write-RawWingetLog -CommandLine $cmdLine -ExitCode $exitCode -Output $output
 
@@ -1044,7 +1008,7 @@ function Install-VCBuildToolsForCuda {
             $cmdLine = "`"$setupExe`" modify --installPath `"$existingInstallPath`" --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended --quiet --norestart --wait"
             Write-Host "Executando: $cmdLine" -ForegroundColor DarkGray
 
-            $output = & $setupExe modify --installPath $existingInstallPath --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended --quiet --norestart --wait 2>&1 | Out-String
+            $output = Invoke-WithNativeErrorHandling { & $setupExe modify --installPath $existingInstallPath --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended --quiet --norestart --wait 2>&1 | Out-String }
             $exitCode = $LASTEXITCODE
             Write-RawWingetLog -CommandLine $cmdLine -ExitCode $exitCode -Output $output
         }
@@ -1077,7 +1041,7 @@ function Test-CudaMinimumVersion {
     $nvccCmd = Get-Command nvcc -ErrorAction SilentlyContinue
     if (-not $nvccCmd) { return $null }
 
-    $versionOutput = & nvcc --version 2>&1 | Out-String
+    $versionOutput = Invoke-WithNativeErrorHandling { & nvcc --version 2>&1 | Out-String }
     if ($versionOutput -match "release\s+([0-9]+\.[0-9]+)") {
         return [version]$Matches[1]
     }
@@ -1167,28 +1131,16 @@ try {
         }
 
         Update-SessionPath
-
-        Install-VSCodeExtensions -Extensions @(
-            [PSCustomObject]@{ Name = "EditorConfig"; Id = "EditorConfig.EditorConfig"; Notes = "Suporte a .editorconfig para padronização de indentação e fim de linha." },
-            [PSCustomObject]@{ Name = "GitLens"; Id = "eamodio.gitlens"; Notes = "Recursos avançados de Git dentro do VS Code." }
-        )
     }
 
     Invoke-Section -Section "PowerShell" -ScriptBlock {
-        # Sincronizar PATH antes de chamar o CLI 'code'.
-        Update-SessionPath
-
-        # Extensão oficial da Microsoft para desenvolvimento PowerShell no VS Code.
-        Install-VSCodeExtensions -Extensions @(
-            [PSCustomObject]@{ Name = "PowerShell"; Id = "ms-vscode.powershell"; Notes = "Extensão oficial da Microsoft para edição, debug e IntelliSense PowerShell." }
-        )
-
         # Módulos gratuitos úteis ao desenvolvimento PowerShell.
         $psGalleryModules = @(
             [PSCustomObject]@{ Name = "Pester"; Notes = "Framework de testes automatizados para PowerShell." },
             [PSCustomObject]@{ Name = "PSScriptAnalyzer"; Notes = "Análise estática, qualidade e boas práticas de scripts." },
             [PSCustomObject]@{ Name = "platyPS"; Notes = "Geração de documentação Markdown para módulos PowerShell." },
-            [PSCustomObject]@{ Name = "Microsoft.PowerShell.Crescendo"; Notes = "Criação de cmdlets PowerShell em volta de ferramentas CLI externas." },
+            # Microsoft.PowerShell.Crescendo removido: exige PowerShell 7+ para instalar/usar
+            # (este script roda em Windows PowerShell 5.1), então nunca é encontrado após a instalação.
             [PSCustomObject]@{ Name = "Microsoft.PowerShell.SecretManagement"; Notes = "Camada padronizada para acesso a segredos." },
             [PSCustomObject]@{ Name = "Microsoft.PowerShell.SecretStore"; Notes = "Cofre local para uso com SecretManagement." }
         )
@@ -1232,12 +1184,6 @@ try {
             }
         }
     }
-
-    Update-SessionPath
-
-    Install-VSCodeExtensions -Extensions @(
-        [PSCustomObject]@{ Name = "Extension Pack for Java"; Id = "vscjava.vscode-java-pack"; Notes = "Pacote principal de extensões Java para VS Code." }
-    )
     }
 
     Invoke-Section -Section "Maven" -ScriptBlock {
@@ -1245,12 +1191,6 @@ try {
     # Apache Maven
     # ===========================================================
     Install-MavenFromApacheZip
-
-    Update-SessionPath
-
-    Install-VSCodeExtensions -Extensions @(
-        [PSCustomObject]@{ Name = "Maven for Java"; Id = "vscjava.vscode-maven"; Notes = "Gerenciamento de projetos Maven no VS Code." }
-    )
     }
 
     Invoke-Section -Section "Node" -ScriptBlock {
@@ -1267,7 +1207,7 @@ try {
     Write-Host "🔎 Validando npm (componente do Node.js)..." -ForegroundColor Yellow
     $npmValidateCmd = Get-Command npm -ErrorAction SilentlyContinue
     if ($npmValidateCmd) {
-        $npmVersion = & npm --version 2>&1 | Out-String
+        $npmVersion = Invoke-WithNativeErrorHandling { & npm --version 2>&1 | Out-String }
         Write-Host "✅ npm disponível: v$($npmVersion.Trim())" -ForegroundColor Green
         Add-Result -Name "npm" -Id "npm" -Source "Node.js" -Status "OK" -Details "Incluído com Node.js. Versão: $($npmVersion.Trim())"
     }
@@ -1291,13 +1231,6 @@ try {
     Install-OrUpgrade-WingetPackage -Package (New-Package -Name "Yarn" -Id "Yarn.Yarn" -Source "winget" `
         -Notes "Gerenciador de pacotes JavaScript. Instalado via winget (Yarn Classic v1).")
 
-    Update-SessionPath
-
-    Install-VSCodeExtensions -Extensions @(
-        [PSCustomObject]@{ Name = "Angular Language Service"; Id = "angular.ng-template"; Notes = "Suporte oficial a templates Angular." },
-        [PSCustomObject]@{ Name = "ESLint"; Id = "dbaeumer.vscode-eslint"; Notes = "Integração ESLint para JavaScript/TypeScript." },
-        [PSCustomObject]@{ Name = "Prettier"; Id = "esbenp.prettier-vscode"; Notes = "Formatador comum para JS/TS/JSON/YAML/Markdown." }
-    )
     }
 
     Invoke-Section -Section "Python" -ScriptBlock {
@@ -1322,7 +1255,7 @@ try {
     Write-Host "🔎 Validando python e pip..." -ForegroundColor Yellow
     $pyValidateCmd = Get-Command python -ErrorAction SilentlyContinue
     if ($pyValidateCmd) {
-        $pyVersion = & python --version 2>&1 | Out-String
+        $pyVersion = Invoke-WithNativeErrorHandling { & python --version 2>&1 | Out-String }
         $pyExitCode = $LASTEXITCODE
         if ($pyExitCode -eq 0 -and $pyVersion.Trim() -match '^Python\s+\d') {
             Write-Host "✅ python disponível: $($pyVersion.Trim())" -ForegroundColor Green
@@ -1339,7 +1272,7 @@ try {
     }
     $pipValidateCmd = Get-Command pip -ErrorAction SilentlyContinue
     if ($pipValidateCmd) {
-        $pipVersion = & pip --version 2>&1 | Out-String
+        $pipVersion = Invoke-WithNativeErrorHandling { & pip --version 2>&1 | Out-String }
         $pipExitCode = $LASTEXITCODE
         if ($pipExitCode -eq 0 -and $pipVersion.Trim() -match '^pip\s+\d') {
             Write-Host "✅ pip disponível: $($pipVersion.Trim())" -ForegroundColor Green
@@ -1359,12 +1292,6 @@ try {
     # Jupyter (via pip)
     # ===========================================================
     Install-JupyterViaPip
-
-    Install-VSCodeExtensions -Extensions @(
-        [PSCustomObject]@{ Name = "Python"; Id = "ms-python.python"; Notes = "Extensão oficial Python para VS Code." },
-        [PSCustomObject]@{ Name = "Pylance"; Id = "ms-python.vscode-pylance"; Notes = "Language server Python da Microsoft." },
-        [PSCustomObject]@{ Name = "Jupyter"; Id = "ms-toolsai.jupyter"; Notes = "Suporte a notebooks Jupyter no VS Code." }
-    )
     }
 
     Invoke-Section -Section "IDE" -ScriptBlock {
@@ -1406,11 +1333,6 @@ try {
     Add-ManualResult -Name "Open Liberty" -Id "OpenLiberty.OpenLiberty" `
         -Reason "Sem pacote winget para Open Liberty. Baixe o ZIP em https://openliberty.io/downloads/, extraia em C:\DevTools\OpenLiberty. Usar Open Liberty (gratuito), nao IBM/WebSphere Liberty comercial."
 
-    Update-SessionPath
-
-    Install-VSCodeExtensions -Extensions @(
-        [PSCustomObject]@{ Name = "YAML"; Id = "redhat.vscode-yaml"; Notes = "Suporte YAML com validação e schemas." }
-    )
     }
 
     Invoke-Section -Section "Database" -ScriptBlock {
