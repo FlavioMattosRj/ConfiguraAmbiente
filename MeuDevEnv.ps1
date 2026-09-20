@@ -68,6 +68,34 @@ function Write-RawWingetLog {
     Add-Content -Path $wingetRawLogPath -Value ""
 }
 
+function Invoke-WithNativeErrorHandling {
+    <#
+    .SYNOPSIS
+    Executa um scriptblock que invoca um comando externo redirecionando stderr para stdout (2>&1),
+    isolando-o do $ErrorActionPreference = 'Stop' global do script.
+
+    .DESCRIPTION
+    Muitos comandos externos (code.cmd, npm, bash.exe/pacman, etc.) escrevem avisos, notices ou
+    deprecation warnings em stderr mesmo quando terminam com sucesso (exit code 0). Quando essa
+    saída é combinada via '2>&1' dentro de um script com $ErrorActionPreference = 'Stop' (agravado
+    pelo uso de Start-Transcript), cada linha de stderr é promovida a erro TERMINANTE e interrompe
+    a execução antes mesmo de o código de saída real ser avaliado — mesmo que o comando tenha
+    funcionado perfeitamente. Esta função define temporariamente $ErrorActionPreference = 'Continue'
+    apenas durante a chamada nativa, restaurando o valor original em seguida (mesmo em caso de
+    exceção), preservando o $LASTEXITCODE do comando para o chamador.
+    #>
+    param([Parameter(Mandatory)][scriptblock]$ScriptBlock)
+
+    $previousEap = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        & $ScriptBlock
+    }
+    finally {
+        $ErrorActionPreference = $previousEap
+    }
+}
+
 function Invoke-WingetQuiet {
     param([Parameter(Mandatory)][string[]]$Arguments)
 
@@ -85,7 +113,7 @@ function Invoke-WingetQuiet {
         }
     }
 
-    $output = & winget @Arguments 2>&1 | Out-String
+    $output = Invoke-WithNativeErrorHandling { & winget @Arguments 2>&1 | Out-String }
     $exitCode = $LASTEXITCODE
 
     Write-RawWingetLog -CommandLine $commandLine -ExitCode $exitCode -Output $output
@@ -489,7 +517,7 @@ function Install-VSCodeExtension {
                 return
             }
 
-            $extOutput = & $codeCmd.Source --install-extension $ExtensionId 2>&1 | Out-String
+            $extOutput = Invoke-WithNativeErrorHandling { & $codeCmd.Source --install-extension $ExtensionId 2>&1 | Out-String }
             $extExitCode = $LASTEXITCODE
 
             Write-RawWingetLog -CommandLine $extInstallCmd -ExitCode $extExitCode -Output $extOutput
@@ -641,7 +669,7 @@ function Install-NpmGlobalTool {
 
         $existingCmd = Get-Command $ValidateCommand -ErrorAction SilentlyContinue
         if ($existingCmd) {
-            $version = & $ValidateCommand --version 2>&1 | Out-String
+            $version = Invoke-WithNativeErrorHandling { & $ValidateCommand --version 2>&1 | Out-String }
             Write-Host "✅ $DisplayName já disponível: $($version.Trim())" -ForegroundColor Green
             Add-Result -Name $DisplayName -Id $NpmPackage -Source "npm" -Status "OK" -Details "Já instalado. Versão: $($version.Trim())"
             return
@@ -657,7 +685,7 @@ function Install-NpmGlobalTool {
         $cmdLine = "npm install -g $NpmPackage"
         Write-Host "Executando: $cmdLine" -ForegroundColor DarkGray
 
-        $installOutput = & npm install -g $NpmPackage 2>&1 | Out-String
+        $installOutput = Invoke-WithNativeErrorHandling { & npm install -g $NpmPackage 2>&1 | Out-String }
         $exitCode = $LASTEXITCODE
         Write-RawWingetLog -CommandLine $cmdLine -ExitCode $exitCode -Output $installOutput
 
@@ -665,7 +693,7 @@ function Install-NpmGlobalTool {
 
         $validateAfter = Get-Command $ValidateCommand -ErrorAction SilentlyContinue
         if ($validateAfter) {
-            $version = & $ValidateCommand --version 2>&1 | Out-String
+            $version = Invoke-WithNativeErrorHandling { & $ValidateCommand --version 2>&1 | Out-String }
             Write-Host "✅ $DisplayName instalado com sucesso. Versão: $($version.Trim())" -ForegroundColor Green
             Add-Result -Name $DisplayName -Id $NpmPackage -Source "npm" -Status "OK" -Details "Instalado via npm. Versão: $($version.Trim())"
         }
@@ -695,7 +723,7 @@ function Install-JupyterViaPip {
 
         $jupyterCmd = Get-Command jupyter -ErrorAction SilentlyContinue
         if ($jupyterCmd) {
-            $version = & jupyter --version 2>&1 | Out-String
+            $version = Invoke-WithNativeErrorHandling { & jupyter --version 2>&1 | Out-String }
             Write-Host "✅ Jupyter já disponível." -ForegroundColor Green
             Add-Result -Name "Jupyter" -Id "jupyterlab+notebook" -Source "pip" -Status "OK" -Details "Já instalado. Saída de 'jupyter --version': $($version.Trim())"
             return
@@ -719,7 +747,7 @@ function Install-JupyterViaPip {
         }
 
         if (-not (Test-Path $venvPython)) {
-            $venvOut = & python -m venv $venvPath 2>&1 | Out-String
+            $venvOut = Invoke-WithNativeErrorHandling { & python -m venv $venvPath 2>&1 | Out-String }
             $venvCode = $LASTEXITCODE
             Write-RawWingetLog -CommandLine "python -m venv $venvPath" -ExitCode $venvCode -Output $venvOut
 
@@ -730,7 +758,7 @@ function Install-JupyterViaPip {
             }
         }
 
-        $pipUpgradeOut = & $venvPython -m pip install --upgrade pip 2>&1 | Out-String
+        $pipUpgradeOut = Invoke-WithNativeErrorHandling { & $venvPython -m pip install --upgrade pip 2>&1 | Out-String }
         $pipUpgradeCode = $LASTEXITCODE
         Write-RawWingetLog -CommandLine "`"$venvPython`" -m pip install --upgrade pip" -ExitCode $pipUpgradeCode -Output $pipUpgradeOut
 
@@ -740,7 +768,7 @@ function Install-JupyterViaPip {
             return
         }
 
-        $installOut = & $venvPython -m pip install jupyterlab notebook 2>&1 | Out-String
+        $installOut = Invoke-WithNativeErrorHandling { & $venvPython -m pip install jupyterlab notebook 2>&1 | Out-String }
         $installCode = $LASTEXITCODE
         Write-RawWingetLog -CommandLine "`"$venvPython`" -m pip install jupyterlab notebook" -ExitCode $installCode -Output $installOut
 
@@ -756,7 +784,7 @@ function Install-JupyterViaPip {
 
         $jupyterAfter = Get-Command jupyter -ErrorAction SilentlyContinue
         if ($jupyterAfter) {
-            $version = & jupyter --version 2>&1 | Out-String
+            $version = Invoke-WithNativeErrorHandling { & jupyter --version 2>&1 | Out-String }
             Write-Host "✅ Jupyter instalado com sucesso." -ForegroundColor Green
             Add-Result -Name "Jupyter" -Id "jupyterlab+notebook" -Source "pip/venv" -Status "OK" -Details "Instalado em venv dedicada ($venvPath). Saída: $($version.Trim())"
         }
@@ -787,7 +815,7 @@ function Resolve-LatestWingetPackageByIdPrefix {
     }
 
     try {
-        $searchOutput = & winget search $IdPrefix --source $Source --accept-source-agreements 2>&1 | Out-String
+        $searchOutput = Invoke-WithNativeErrorHandling { & winget search $IdPrefix --source $Source --accept-source-agreements 2>&1 | Out-String }
         Write-RawWingetLog -CommandLine "winget search $IdPrefix --source $Source --accept-source-agreements" -ExitCode $LASTEXITCODE -Output $searchOutput
 
         if ($LASTEXITCODE -ne 0) {
@@ -857,7 +885,7 @@ function Install-MavenFromApacheZip {
 
         $mvnCmd = Get-Command mvn -ErrorAction SilentlyContinue
         if ($mvnCmd) {
-            $mvnVersionOutput = & mvn -v 2>&1 | Out-String
+            $mvnVersionOutput = Invoke-WithNativeErrorHandling { & mvn -v 2>&1 | Out-String }
             if ($mvnVersionOutput -match "Apache Maven\s+$([regex]::Escape($latestVersion))") {
                 Write-Host "✅ Apache Maven já está na versão mais nova encontrada: $latestVersion." -ForegroundColor Green
                 Add-Result -Name "Apache Maven" -Id "Apache.Maven.Zip" -Source "Apache ZIP" -Status "OK" -Details "Já instalado. $($mvnVersionOutput.Trim())"
@@ -901,7 +929,7 @@ function Install-MavenFromApacheZip {
 
         $mvnAfter = Get-Command mvn -ErrorAction SilentlyContinue
         if ($mvnAfter) {
-            $version = & mvn -v 2>&1 | Out-String
+            $version = Invoke-WithNativeErrorHandling { & mvn -v 2>&1 | Out-String }
             Write-Host "✅ Apache Maven instalado/configurado com sucesso." -ForegroundColor Green
             Add-Result -Name "Apache Maven" -Id "Apache.Maven.Zip" -Source "Apache ZIP" -Status "OK" -Details "MAVEN_HOME=$mavenHome. Saída: $($version.Trim())"
         }
@@ -941,7 +969,7 @@ function Invoke-Msys2Pacman {
     $cmdLine = "`"$bashExe`" -lc `"$PacmanCommand`""
     Write-Host "Executando: $cmdLine" -ForegroundColor DarkGray
 
-    $output = & $bashExe -lc $PacmanCommand 2>&1 | Out-String
+    $output = Invoke-WithNativeErrorHandling { & $bashExe -lc $PacmanCommand 2>&1 | Out-String }
     $exitCode = $LASTEXITCODE
     Write-RawWingetLog -CommandLine $cmdLine -ExitCode $exitCode -Output $output
 
@@ -1044,7 +1072,7 @@ function Install-VCBuildToolsForCuda {
             $cmdLine = "`"$setupExe`" modify --installPath `"$existingInstallPath`" --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended --quiet --norestart --wait"
             Write-Host "Executando: $cmdLine" -ForegroundColor DarkGray
 
-            $output = & $setupExe modify --installPath $existingInstallPath --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended --quiet --norestart --wait 2>&1 | Out-String
+            $output = Invoke-WithNativeErrorHandling { & $setupExe modify --installPath $existingInstallPath --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended --quiet --norestart --wait 2>&1 | Out-String }
             $exitCode = $LASTEXITCODE
             Write-RawWingetLog -CommandLine $cmdLine -ExitCode $exitCode -Output $output
         }
@@ -1077,7 +1105,7 @@ function Test-CudaMinimumVersion {
     $nvccCmd = Get-Command nvcc -ErrorAction SilentlyContinue
     if (-not $nvccCmd) { return $null }
 
-    $versionOutput = & nvcc --version 2>&1 | Out-String
+    $versionOutput = Invoke-WithNativeErrorHandling { & nvcc --version 2>&1 | Out-String }
     if ($versionOutput -match "release\s+([0-9]+\.[0-9]+)") {
         return [version]$Matches[1]
     }
@@ -1188,7 +1216,8 @@ try {
             [PSCustomObject]@{ Name = "Pester"; Notes = "Framework de testes automatizados para PowerShell." },
             [PSCustomObject]@{ Name = "PSScriptAnalyzer"; Notes = "Análise estática, qualidade e boas práticas de scripts." },
             [PSCustomObject]@{ Name = "platyPS"; Notes = "Geração de documentação Markdown para módulos PowerShell." },
-            [PSCustomObject]@{ Name = "Microsoft.PowerShell.Crescendo"; Notes = "Criação de cmdlets PowerShell em volta de ferramentas CLI externas." },
+            # Microsoft.PowerShell.Crescendo removido: exige PowerShell 7+ para instalar/usar
+            # (este script roda em Windows PowerShell 5.1), então nunca é encontrado após a instalação.
             [PSCustomObject]@{ Name = "Microsoft.PowerShell.SecretManagement"; Notes = "Camada padronizada para acesso a segredos." },
             [PSCustomObject]@{ Name = "Microsoft.PowerShell.SecretStore"; Notes = "Cofre local para uso com SecretManagement." }
         )
@@ -1267,7 +1296,7 @@ try {
     Write-Host "🔎 Validando npm (componente do Node.js)..." -ForegroundColor Yellow
     $npmValidateCmd = Get-Command npm -ErrorAction SilentlyContinue
     if ($npmValidateCmd) {
-        $npmVersion = & npm --version 2>&1 | Out-String
+        $npmVersion = Invoke-WithNativeErrorHandling { & npm --version 2>&1 | Out-String }
         Write-Host "✅ npm disponível: v$($npmVersion.Trim())" -ForegroundColor Green
         Add-Result -Name "npm" -Id "npm" -Source "Node.js" -Status "OK" -Details "Incluído com Node.js. Versão: $($npmVersion.Trim())"
     }
@@ -1322,7 +1351,7 @@ try {
     Write-Host "🔎 Validando python e pip..." -ForegroundColor Yellow
     $pyValidateCmd = Get-Command python -ErrorAction SilentlyContinue
     if ($pyValidateCmd) {
-        $pyVersion = & python --version 2>&1 | Out-String
+        $pyVersion = Invoke-WithNativeErrorHandling { & python --version 2>&1 | Out-String }
         $pyExitCode = $LASTEXITCODE
         if ($pyExitCode -eq 0 -and $pyVersion.Trim() -match '^Python\s+\d') {
             Write-Host "✅ python disponível: $($pyVersion.Trim())" -ForegroundColor Green
@@ -1339,7 +1368,7 @@ try {
     }
     $pipValidateCmd = Get-Command pip -ErrorAction SilentlyContinue
     if ($pipValidateCmd) {
-        $pipVersion = & pip --version 2>&1 | Out-String
+        $pipVersion = Invoke-WithNativeErrorHandling { & pip --version 2>&1 | Out-String }
         $pipExitCode = $LASTEXITCODE
         if ($pipExitCode -eq 0 -and $pipVersion.Trim() -match '^pip\s+\d') {
             Write-Host "✅ pip disponível: $($pipVersion.Trim())" -ForegroundColor Green
